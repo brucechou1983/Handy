@@ -43,7 +43,7 @@ const Onboarding: React.FC<OnboardingProps> = ({ onModelSelected }) => {
   };
 
   const getRecommendedBadge = (modelId: string): boolean => {
-    return modelId === "small";
+    return modelId === "qwen3-asr";
   };
 
   return (
