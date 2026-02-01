@@ -198,7 +198,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onError }) => {
         if (transcriptionStatus === current) {
           setModelStatus("ready");
         } else {
-          setModelStatus("loading");
+          setModelStatus("none");
         }
       } else {
         setModelStatus("none");
@@ -276,6 +276,48 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onError }) => {
     setModelError(null);
   };
 
+  const handleQwenSetup = async (modelId: string) => {
+    try {
+      setModelError(null);
+      setModelStatus("loading");
+      setShowModelDropdown(false);
+
+      // Check prerequisites
+      const status = await invoke<{ available: boolean; message: string }>(
+        "check_qwen_asr_prerequisites",
+      );
+
+      if (!status.available) {
+        // Try to install mlx-audio automatically
+        try {
+          await invoke<string>("install_qwen_asr_dependencies");
+        } catch (installErr) {
+          const installErrMsg = `${installErr}`;
+          setModelError(
+            `Qwen3-ASR setup failed: ${installErrMsg}`,
+          );
+          setModelStatus("error");
+          onError?.(
+            `Qwen3-ASR setup failed: ${installErrMsg}`,
+          );
+          return;
+        }
+      }
+
+      // Mark model as ready
+      await invoke("setup_qwen_asr");
+      await loadModels();
+
+      // Auto-select it
+      await handleModelSelect(modelId);
+    } catch (err) {
+      const errorMsg = `Qwen3-ASR setup failed: ${err}`;
+      setModelError(errorMsg);
+      setModelStatus("error");
+      onError?.(errorMsg);
+    }
+  };
+
   return (
     <>
       {/* Model Status and Switcher */}
@@ -296,6 +338,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onError }) => {
             onModelSelect={handleModelSelect}
             onModelDownload={handleModelDownload}
             onModelDelete={handleModelDelete}
+            onQwenSetup={handleQwenSetup}
             onError={onError}
           />
         )}
