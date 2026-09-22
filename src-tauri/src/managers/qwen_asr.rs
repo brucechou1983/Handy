@@ -6,15 +6,28 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use tauri::Manager;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct SidecarRequest {
     command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_path: Option<String>,
+    /// Language name understood by Qwen3-ASR ("Chinese", "English", ...).
+    /// `None` asks the model to detect the language itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     language: Option<String>,
+    /// Free-form context that biases the transcription.
     #[serde(skip_serializing_if = "Option::is_none")]
     system_prompt: Option<String>,
+    /// Vocabulary/hotwords the model should favour, folded into the context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hotwords: Option<Vec<String>>,
+}
+
+/// One transcription, plus the language the model reported for it.
+#[derive(Debug, Clone)]
+pub struct QwenTranscription {
+    pub text: String,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +43,8 @@ struct SidecarResponse {
     model_loaded: Option<bool>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    mlx_audio_version: Option<String>,
 }
 
 pub struct QwenAsrManager {
@@ -43,6 +58,13 @@ struct SidecarProcess {
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
 }
+
+/// mlx-audio 0.5.x added native `system_prompt`/`hotwords` arguments and
+/// language auto-detection. The sidecar relies on all three, so anything older
+/// (including the git snapshots earlier Handy versions installed) is rejected
+/// and the user is sent back through Setup.
+const MIN_MLX_AUDIO: (u32, u32, u32) = (0, 5, 5);
+const MLX_AUDIO_REQUIREMENT: &str = "mlx-audio>=0.5.5,<0.6";
 
 /// Path to the self-contained venv for Qwen ASR.
 fn venv_dir() -> PathBuf {
@@ -91,6 +113,48 @@ fn resolve_uv() -> Option<String> {
     None
 }
 
+/// Version of mlx-audio installed in the venv, if the package is importable.
+fn installed_mlx_audio_version(python: &std::path::Path) -> Option<String> {
+    let output = Command::new(python)
+        .args([
+            "-c",
+            "from importlib.metadata import version; print(version('mlx-audio'))",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+/// Parse the leading `major.minor.patch` of a Python version string.
+fn parse_version(raw: &str) -> (u32, u32, u32) {
+    let mut parts = raw.split('.').map(|piece| {
+        piece
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
+
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
 impl QwenAsrManager {
     pub fn new(app: &tauri::App) -> Result<Self> {
         let sidecar_script_path = app
@@ -127,25 +191,32 @@ impl QwenAsrManager {
             });
         }
 
-        // Check mlx-audio is importable in the venv
-        let mlx_audio_ok = Command::new(&python)
-            .args(["-c", "import mlx_audio; print('ok')"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // Check mlx-audio is installed in the venv, and recent enough
+        let installed = match installed_mlx_audio_version(&python) {
+            Some(version) => version,
+            None => {
+                return Ok(PrerequisiteStatus {
+                    available: false,
+                    message: "mlx-audio is not installed in the Qwen ASR environment."
+                        .to_string(),
+                })
+            }
+        };
 
-        if !mlx_audio_ok {
+        if parse_version(&installed) < MIN_MLX_AUDIO {
+            let (major, minor, patch) = MIN_MLX_AUDIO;
             return Ok(PrerequisiteStatus {
                 available: false,
-                message: "mlx-audio is not installed in the Qwen ASR environment.".to_string(),
+                message: format!(
+                    "mlx-audio {} is out of date (need {}.{}.{}+). Run Setup to update it.",
+                    installed, major, minor, patch
+                ),
             });
         }
 
         Ok(PrerequisiteStatus {
             available: true,
-            message: "Ready".to_string(),
+            message: format!("Ready (mlx-audio {})", installed),
         })
     }
 
@@ -178,9 +249,11 @@ impl QwenAsrManager {
             println!("QwenASR: venv created successfully");
         }
 
-        // Install mlx-audio into the venv
+        // Install/upgrade mlx-audio into the venv. Qwen3-ASR support used to
+        // exist only on the GitHub main branch; it has been on PyPI since
+        // 0.4.0, so a released version is pinned instead of a moving branch.
         let output = Command::new(&uv)
-            .args(["pip", "install", "-U", "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git"])
+            .args(["pip", "install", "-U", MLX_AUDIO_REQUIREMENT])
             .arg("--python")
             .arg(venv.join("bin").join("python3"))
             .env("PATH", &path_env)
@@ -284,15 +357,16 @@ impl QwenAsrManager {
 
         let response = self.send_command(&SidecarRequest {
             command: "load_model".to_string(),
-            audio_path: None,
-            language: None,
-            system_prompt: None,
+            ..Default::default()
         })?;
 
         if response.ok {
             let mut loaded = self.model_loaded.lock().unwrap();
             *loaded = true;
-            println!("QwenAsrManager: Model loaded successfully");
+            println!(
+                "QwenAsrManager: Model loaded successfully (mlx-audio {})",
+                response.mlx_audio_version.as_deref().unwrap_or("unknown")
+            );
             Ok(())
         } else {
             Err(anyhow::anyhow!(
@@ -303,16 +377,30 @@ impl QwenAsrManager {
     }
 
     /// Transcribe audio from a WAV file path.
-    pub fn transcribe_file(&self, audio_path: &str, language: Option<&str>, system_prompt: Option<&str>) -> Result<String> {
+    ///
+    /// `language` is a Qwen3-ASR language name; `None` lets the model detect
+    /// the language and report it back. `hotwords` biases the transcription
+    /// toward names or domain terms.
+    pub fn transcribe_file(
+        &self,
+        audio_path: &str,
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        hotwords: Option<Vec<String>>,
+    ) -> Result<QwenTranscription> {
         let response = self.send_command(&SidecarRequest {
             command: "transcribe".to_string(),
             audio_path: Some(audio_path.to_string()),
             language: language.map(|s| s.to_string()),
             system_prompt: system_prompt.map(|s| s.to_string()),
+            hotwords,
         })?;
 
         if response.ok {
-            Ok(response.text.unwrap_or_default())
+            Ok(QwenTranscription {
+                text: response.text.unwrap_or_default(),
+                language: response.language,
+            })
         } else {
             Err(anyhow::anyhow!(
                 "Transcription failed: {}",
@@ -323,9 +411,18 @@ impl QwenAsrManager {
 
     /// Transcribe audio from f32 samples (16kHz mono).
     /// Writes a temporary WAV file, transcribes, then cleans up.
-    pub fn transcribe(&self, audio: &[f32], language: Option<&str>, system_prompt: Option<&str>) -> Result<String> {
+    pub fn transcribe(
+        &self,
+        audio: &[f32],
+        language: Option<&str>,
+        system_prompt: Option<&str>,
+        hotwords: Option<Vec<String>>,
+    ) -> Result<QwenTranscription> {
         if audio.is_empty() {
-            return Ok(String::new());
+            return Ok(QwenTranscription {
+                text: String::new(),
+                language: None,
+            });
         }
 
         // Write audio to a temporary WAV file
@@ -336,7 +433,7 @@ impl QwenAsrManager {
 
         write_wav(tmp_path_str, audio, 16000)?;
 
-        let result = self.transcribe_file(tmp_path_str, language, system_prompt);
+        let result = self.transcribe_file(tmp_path_str, language, system_prompt, hotwords);
 
         // Clean up temp file
         let _ = std::fs::remove_file(&tmp_path);

@@ -6,29 +6,36 @@ Communicates with the Rust backend via stdin/stdout JSON protocol.
 Uses mlx-audio for inference on Apple Silicon.
 
 Protocol:
-  Request:  {"command": "transcribe", "audio_path": "/tmp/audio.wav", "language": "Chinese", "system_prompt": "請使用繁體中文輸出"}
-  Response: {"ok": true, "text": "Hello world"}
+  Request:  {"command": "transcribe", "audio_path": "/tmp/audio.wav",
+             "language": "Chinese", "system_prompt": "...", "hotwords": ["Handy"]}
+  Response: {"ok": true, "text": "Hello world", "language": "English"}
 
   Request:  {"command": "load_model"}
-  Response: {"ok": true}
+  Response: {"ok": true, "mlx_audio_version": "0.5.5"}
 
   Request:  {"command": "health"}
-  Response: {"ok": true, "model_loaded": true}
+  Response: {"ok": true, "model_loaded": true, "mlx_audio_version": "0.5.5"}
 
   Request:  {"command": "shutdown"}
   (process exits)
+
+Omitting "language" (or passing null / "auto") lets the model detect the
+language itself and report it back in the response.
 """
 
 import json
 import sys
 import os
 import traceback
-import types
 
 MODEL_ID = "mlx-community/Qwen3-ASR-0.6B-8bit"
 
+# mlx-audio grew native `system_prompt` and `hotwords` arguments, plus
+# language auto-detection, in 0.5.x. Earlier versions needed the prompt to be
+# monkey-patched in and could not auto-detect, so Handy requires 0.5.5+.
+MIN_MLX_AUDIO = (0, 5, 5)
+
 model = None
-_original_build_prompt = None
 
 
 def send_response(data: dict):
@@ -42,41 +49,59 @@ def send_error(message: str):
     send_response({"ok": False, "error": message})
 
 
+def mlx_audio_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("mlx-audio")
+    except Exception:
+        return "unknown"
+
+
+def _parsed_version(raw: str):
+    parts = []
+    for piece in raw.split(".")[:3]:
+        digits = ""
+        for ch in piece:
+            if not ch.isdigit():
+                break
+            digits += ch
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
 def load_model():
-    global model, _original_build_prompt
+    global model
+    installed = mlx_audio_version()
+
+    if installed == "unknown" or _parsed_version(installed) < MIN_MLX_AUDIO:
+        send_error(
+            "mlx-audio {} is too old (need {}+). Re-run Setup for Qwen3 ASR "
+            "in Handy's model settings to update it.".format(
+                installed, ".".join(str(n) for n in MIN_MLX_AUDIO)
+            )
+        )
+        return
+
     try:
         from mlx_audio.stt import load
+
         model = load(MODEL_ID)
-        # Save the original _build_prompt for monkey-patching later
-        _original_build_prompt = model._model._build_prompt
-        send_response({"ok": True})
+        send_response({"ok": True, "mlx_audio_version": installed})
     except Exception as e:
         send_error(f"Failed to load model: {e}")
 
 
-def _make_build_prompt_with_system(system_prompt: str):
-    """Create a patched _build_prompt that injects a system prompt."""
-    import mlx.core as mx
-
-    def _build_prompt_with_system(self, num_audio_tokens, language="English"):
-        supported = self.config.support_languages or []
-        supported_lower = {lang.lower(): lang for lang in supported}
-        lang_name = supported_lower.get(language.lower(), language)
-
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n<|audio_start|>{'<|audio_pad|>' * num_audio_tokens}<|audio_end|><|im_end|>\n"
-            f"<|im_start|>assistant\nlanguage {lang_name}<asr_text>"
-        )
-
-        input_ids = self._tokenizer.encode(prompt, return_tensors="np")
-        return mx.array(input_ids)
-
-    return _build_prompt_with_system
+def _first_language(value):
+    """`generate` reports the language as a list for batched inputs."""
+    if isinstance(value, (list, tuple)):
+        return str(value[0]) if value else None
+    return str(value) if value else None
 
 
 def handle_transcribe(request: dict):
-    global model, _original_build_prompt
     if model is None:
         send_error("Model not loaded")
         return
@@ -86,42 +111,43 @@ def handle_transcribe(request: dict):
         send_error(f"Audio file not found: {audio_path}")
         return
 
+    # language=None asks the model to detect the language itself.
     language = request.get("language")
-    # Qwen3-ASR requires an explicit language — no auto-detect support
-    if language in (None, "", "auto"):
-        language = "English"
+    if language in ("", "auto"):
+        language = None
+
+    kwargs = {"language": language}
 
     system_prompt = request.get("system_prompt")
+    if system_prompt:
+        kwargs["system_prompt"] = system_prompt
+
+    hotwords = request.get("hotwords")
+    if hotwords:
+        kwargs["hotwords"] = list(hotwords)
 
     try:
-        inner_model = model._model
-
-        # Monkey-patch _build_prompt if system_prompt is provided
-        if system_prompt:
-            patched = _make_build_prompt_with_system(system_prompt)
-            inner_model._build_prompt = types.MethodType(patched, inner_model)
-        else:
-            # Restore original
-            inner_model._build_prompt = types.MethodType(_original_build_prompt.__func__, inner_model)
-
-        result = model.generate(audio_path, language=language)
+        result = model.generate(audio_path, **kwargs)
         text = result.text if hasattr(result, "text") else str(result)
-        detected_lang = result.language if hasattr(result, "language") else None
-        send_response({
-            "ok": True,
-            "text": text.strip(),
-            "language": detected_lang,
-        })
+        send_response(
+            {
+                "ok": True,
+                "text": text.strip(),
+                "language": _first_language(getattr(result, "language", None)),
+            }
+        )
     except Exception as e:
         send_error(f"Transcription failed: {e}\n{traceback.format_exc()}")
-    finally:
-        # Always restore original to avoid leaking state
-        if _original_build_prompt is not None:
-            inner_model._build_prompt = types.MethodType(_original_build_prompt.__func__, inner_model)
 
 
 def handle_health():
-    send_response({"ok": True, "model_loaded": model is not None})
+    send_response(
+        {
+            "ok": True,
+            "model_loaded": model is not None,
+            "mlx_audio_version": mlx_audio_version(),
+        }
+    )
 
 
 def main():

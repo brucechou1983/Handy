@@ -1,3 +1,4 @@
+use crate::chinese;
 use crate::managers::model::ModelManager;
 use crate::managers::qwen_asr::QwenAsrManager;
 use crate::settings::get_settings;
@@ -245,29 +246,27 @@ impl TranscriptionManager {
 
         match backend.as_deref() {
             Some("qwen-asr") => {
-                let (language, system_prompt) = match settings.selected_language.as_str() {
-                    "auto" | "auto-zh-TW" | "auto-zh-CN" => (Some("English"), None),
-                    "zh-TW" => (Some("Chinese"), Some("請使用繁體中文輸出")),
-                    "zh" => (Some("Chinese"), Some("請使用繁體中文輸出")),
-                    "zh-CN" => (Some("Chinese"), None),
-                    "en" => (Some("English"), None),
-                    "ja" => (Some("Japanese"), None),
-                    "ko" => (Some("Korean"), None),
-                    "fr" => (Some("French"), None),
-                    "de" => (Some("German"), None),
-                    "es" => (Some("Spanish"), None),
-                    "pt" => (Some("Portuguese"), None),
-                    "ru" => (Some("Russian"), None),
-                    "it" => (Some("Italian"), None),
-                    other => (Some(other), None),
-                };
+                let language = qwen_language(&settings.selected_language);
 
-                let result = self.qwen_asr_manager.transcribe(&audio, language, system_prompt)?;
+                // `system_prompt`/`hotwords` stay None until Handy exposes a
+                // custom-vocabulary setting; Qwen3-ASR treats that field as
+                // biasing context, not as an instruction to follow.
+                let result = self
+                    .qwen_asr_manager
+                    .transcribe(&audio, language, None, None)?;
 
                 let et = std::time::Instant::now();
-                println!("\nQwen3-ASR took {}ms", (et - st).as_millis());
+                println!(
+                    "\nQwen3-ASR took {}ms (language: {})",
+                    (et - st).as_millis(),
+                    result.language.as_deref().unwrap_or("unreported")
+                );
 
-                Ok(result)
+                Ok(apply_chinese_script(
+                    result.text,
+                    &settings,
+                    result.language.as_deref(),
+                ))
             }
             _ => {
                 // Whisper backend (default)
@@ -294,25 +293,15 @@ impl TranscriptionManager {
         // Initialize parameters
         let mut params = FullParams::new(SamplingStrategy::default());
 
-        // Handle Chinese language variants
-        let (language, initial_prompt) = match settings.selected_language.as_str() {
-            "auto-zh-TW" => {
-                (None, Some("English. 繁體中文。"))
-            }
-            "zh-TW" => {
-                (Some("zh"), Some("繁體中文。"))
-            }
-            "zh-CN" => {
-                (Some("zh"), Some("简体中文。"))
-            }
-            lang => (Some(lang), None),
+        // Chinese variants share one Whisper language; which script comes out
+        // is decided after transcription, in `apply_chinese_script`.
+        let language = match settings.selected_language.as_str() {
+            "auto" | "auto-zh-TW" | "auto-zh-CN" => None,
+            "zh-TW" | "zh-CN" => Some("zh"),
+            lang => Some(lang),
         };
 
         params.set_language(language);
-
-        if let Some(prompt) = initial_prompt {
-            params.set_initial_prompt(prompt);
-        }
 
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -348,6 +337,188 @@ impl TranscriptionManager {
         };
         println!("\ntook {}ms{}", (et - st).as_millis(), translation_note);
 
-        Ok(result.trim().to_string())
+        // Whisper does not report the language it detected back through this
+        // pipeline, so the auto modes fall back to a script check.
+        Ok(apply_chinese_script(
+            result.trim().to_string(),
+            settings,
+            None,
+        ))
+    }
+}
+
+/// Map a Handy language code to a Qwen3-ASR language name.
+///
+/// `None` means "detect it": that is the right answer both for the auto modes
+/// and for the languages Handy offers that Qwen3-ASR does not list, where
+/// passing the code through would land in the prompt as a bogus language name.
+fn qwen_language(code: &str) -> Option<&'static str> {
+    match code {
+        "zh" | "zh-TW" | "zh-CN" => Some("Chinese"),
+        "yue" => Some("Cantonese"),
+        "en" => Some("English"),
+        "ar" => Some("Arabic"),
+        "cs" => Some("Czech"),
+        "da" => Some("Danish"),
+        "de" => Some("German"),
+        "el" => Some("Greek"),
+        "es" => Some("Spanish"),
+        "fa" => Some("Persian"),
+        "fi" => Some("Finnish"),
+        "fil" => Some("Filipino"),
+        "fr" => Some("French"),
+        "hi" => Some("Hindi"),
+        "hu" => Some("Hungarian"),
+        "id" => Some("Indonesian"),
+        "it" => Some("Italian"),
+        "ja" => Some("Japanese"),
+        "ko" => Some("Korean"),
+        "mk" => Some("Macedonian"),
+        "ms" => Some("Malay"),
+        "nl" => Some("Dutch"),
+        "pl" => Some("Polish"),
+        "pt" => Some("Portuguese"),
+        "ro" => Some("Romanian"),
+        "ru" => Some("Russian"),
+        "sv" => Some("Swedish"),
+        "th" => Some("Thai"),
+        "tr" => Some("Turkish"),
+        "vi" => Some("Vietnamese"),
+        _ => None,
+    }
+}
+
+/// Enforce the Chinese script the user selected.
+///
+/// Neither backend can be talked into a script: Whisper's `initial_prompt` and
+/// Qwen3-ASR's system field are biasing context, and both models default to
+/// Simplified for Mandarin whatever the prompt says. So the conversion happens
+/// here. `reported_language` is the language the backend says it transcribed,
+/// when it says; otherwise the script of the text decides, which keeps
+/// Japanese and Korean output (shared Han characters) untouched.
+fn apply_chinese_script(
+    text: String,
+    settings: &crate::settings::AppSettings,
+    reported_language: Option<&str>,
+) -> String {
+    let target = match settings.selected_language.as_str() {
+        "zh-TW" | "auto-zh-TW" => chinese::to_traditional,
+        "zh-CN" | "auto-zh-CN" => chinese::to_simplified,
+        // "zh" is "Chinese (Auto)": leave the model's own script alone.
+        _ => return text,
+    };
+
+    // Translated output is English, and a translation request outranks a
+    // script preference.
+    if settings.translate_to_english {
+        return text;
+    }
+
+    let is_chinese = match reported_language {
+        Some(language) => matches!(
+            language.to_ascii_lowercase().as_str(),
+            "chinese" | "cantonese"
+        ),
+        None => chinese::looks_chinese(&text),
+    };
+
+    if is_chinese {
+        target(&text)
+    } else {
+        text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::get_default_settings;
+
+    fn settings(language: &str) -> crate::settings::AppSettings {
+        let mut settings = get_default_settings();
+        settings.selected_language = language.to_string();
+        settings
+    }
+
+    /// What Qwen3-ASR actually returns for Qwen's own asr_zh.wav sample, and
+    /// what it should reach the clipboard as when Traditional is selected.
+    const SIMPLIFIED: &str = "甚至出现交易几乎停滞的情况。";
+    const TRADITIONAL: &str = "甚至出現交易幾乎停滯的情況。";
+
+    #[test]
+    fn forced_traditional_converts_reported_chinese() {
+        assert_eq!(
+            apply_chinese_script(SIMPLIFIED.to_string(), &settings("zh-TW"), Some("Chinese")),
+            TRADITIONAL
+        );
+    }
+
+    #[test]
+    fn forced_traditional_converts_unreported_chinese() {
+        assert_eq!(
+            apply_chinese_script(SIMPLIFIED.to_string(), &settings("zh-TW"), None),
+            TRADITIONAL
+        );
+    }
+
+    #[test]
+    fn forced_simplified_converts_back() {
+        assert_eq!(
+            apply_chinese_script(TRADITIONAL.to_string(), &settings("zh-CN"), Some("Chinese")),
+            SIMPLIFIED
+        );
+    }
+
+    #[test]
+    fn auto_traditional_converts_only_chinese() {
+        let japanese = "これは日本語です".to_string();
+        assert_eq!(
+            apply_chinese_script(japanese.clone(), &settings("auto-zh-TW"), Some("Japanese")),
+            japanese
+        );
+        // Whisper reports nothing, so the script has to decide.
+        assert_eq!(
+            apply_chinese_script(japanese.clone(), &settings("auto-zh-TW"), None),
+            japanese
+        );
+        assert_eq!(
+            apply_chinese_script(SIMPLIFIED.to_string(), &settings("auto-zh-TW"), None),
+            TRADITIONAL
+        );
+    }
+
+    #[test]
+    fn other_languages_are_left_alone() {
+        for language in ["auto", "zh", "en", "ja"] {
+            assert_eq!(
+                apply_chinese_script(SIMPLIFIED.to_string(), &settings(language), Some("Chinese")),
+                SIMPLIFIED,
+                "{} should not touch the script",
+                language
+            );
+        }
+    }
+
+    #[test]
+    fn translation_outranks_the_script_preference() {
+        let mut settings = settings("zh-TW");
+        settings.translate_to_english = true;
+        assert_eq!(
+            apply_chinese_script(SIMPLIFIED.to_string(), &settings, Some("Chinese")),
+            SIMPLIFIED
+        );
+    }
+
+    #[test]
+    fn qwen_languages_map_to_names_or_auto_detect() {
+        assert_eq!(qwen_language("zh-TW"), Some("Chinese"));
+        assert_eq!(qwen_language("zh-CN"), Some("Chinese"));
+        assert_eq!(qwen_language("ja"), Some("Japanese"));
+        assert_eq!(qwen_language("fil"), Some("Filipino"));
+        // Auto modes, and the languages Qwen3-ASR does not support, detect.
+        assert_eq!(qwen_language("auto"), None);
+        assert_eq!(qwen_language("auto-zh-TW"), None);
+        assert_eq!(qwen_language("uk"), None);
+        assert_eq!(qwen_language("he"), None);
     }
 }

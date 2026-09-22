@@ -1,6 +1,6 @@
 # Qwen3-ASR 0.6B Setup Guide
 
-Handy supports [Qwen3-ASR-0.6B](https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit) as an alternative speech-to-text backend via [mlx-audio](https://github.com/Blaizzy/mlx-audio), running natively on Apple Silicon.
+Handy supports [Qwen3-ASR-0.6B](https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit) as an alternative speech-to-text backend via [mlx-audio](https://github.com/Blaizzy/mlx-audio) (0.5.5 or newer), running natively on Apple Silicon.
 
 ## Prerequisites
 
@@ -18,11 +18,34 @@ When you click **"Qwen3 ASR 0.6B → Setup"** in the model selector, Handy:
 
 1. Locates `uv` on your system (checks `/opt/homebrew/bin/uv`, `/usr/local/bin/uv`, or resolves via login shell)
 2. Creates an isolated Python 3.11 venv at `~/Library/Application Support/com.handy.app/qwen-asr-venv/`
-3. Installs `mlx-audio` (from GitHub main branch) into the venv
-4. Verifies the installation by importing `mlx_audio`
+3. Installs `mlx-audio>=0.5.5,<0.6` from PyPI into the venv (upgrading it if an older version is already there)
+4. Verifies the installed version
 5. On first transcription, downloads the `mlx-community/Qwen3-ASR-0.6B-8bit` model from HuggingFace
 
-A Python sidecar process (`qwen_asr_sidecar.py`) is spawned using the venv's Python and communicates with the Rust backend via stdin/stdout JSON protocol.
+A Python sidecar process (`qwen_asr_sidecar.py`) is spawned using the venv's Python and communicates with the Rust backend via stdin/stdout JSON protocol:
+
+```jsonc
+// Handy → sidecar. Omitting "language" lets the model detect it.
+{"command": "transcribe", "audio_path": "/tmp/handy_qwen_asr_tmp.wav",
+ "language": "Chinese", "system_prompt": "...", "hotwords": ["Handy"]}
+// sidecar → Handy
+{"ok": true, "text": "…", "language": "Chinese"}
+```
+
+`system_prompt` and `hotwords` are the model's [context/hotword](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf#context--hotwords) mechanism, which biases the transcription toward names and domain vocabulary. They are *not* an instruction slot — the model will not follow "reply in Traditional Chinese" placed there. No Handy setting fills them in yet.
+
+## Why 0.5.5 or newer
+
+mlx-audio 0.5.x is what made Handy's use of this model straightforward:
+
+- `generate(..., system_prompt=..., hotwords=[...])` are real arguments, so Handy no longer monkey-patches mlx-audio's private prompt builder
+- `language=None` auto-detects and reports the language back, so Handy's **Auto** no longer has to fall back to English
+
+The prerequisite check reads the installed version and asks you to re-run Setup if it is older than 0.5.5.
+
+## Chinese Script
+
+Qwen3-ASR takes a language ("Chinese"), not a script, and emits Simplified for Mandarin regardless of the prompt. Handy converts the finished transcription with OpenCC instead — see the **Language** setting. This happens in the Rust backend, so it applies to the Whisper models too.
 
 ## Building from Source
 
@@ -63,31 +86,27 @@ pip3 uninstall xattr
 pyenv rehash  # if using pyenv
 ```
 
-### "mlx-audio is not installed" even after setup succeeds
+### "mlx-audio X is out of date (need 0.5.5+). Run Setup to update it."
 
-**Cause:** The PyPI release of mlx-audio (v0.2.10 as of Feb 2026) does not include Qwen3-ASR support. Only the unreleased v0.3.1+ on GitHub main has the `mlx_audio.stt.load` function needed for Qwen3-ASR.
+**Cause:** The venv still has the mlx-audio that an earlier Handy version installed from the GitHub main branch (0.3.1), which lacks the native `system_prompt`/`hotwords` arguments and language auto-detection.
 
-**Fix:** Handy now installs mlx-audio from the GitHub main branch:
-```
-git+https://github.com/Blaizzy/mlx-audio.git
-```
-This is handled automatically during setup. If you need to manually fix an existing venv:
+**Fix:** Click **Setup** again in the model selector; it upgrades in place. Or by hand:
 ```bash
-uv pip install "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio.git" \
+uv pip install -U "mlx-audio>=0.5.5,<0.6" \
   --python ~/Library/Application\ Support/com.handy.app/qwen-asr-venv/bin/python3
 ```
 
-### "cannot import name 'load' from 'mlx_audio.stt'"
+### "mlx-audio is not installed" even after setup succeeds
 
-**Cause:** Same as above — the installed mlx-audio version is too old.
+**Cause:** The venv exists but the install did not finish — usually a network failure during `uv pip install`.
 
-**Fix:** Same as above — install from GitHub main branch.
+**Fix:** Run Setup again, or install by hand with the command above. Qwen3-ASR support has been in the PyPI releases of mlx-audio since 0.4.0, so no git checkout is needed any more.
 
 ### `mlx_audio.__version__` AttributeError
 
-**Cause:** The `mlx_audio` package does not expose a `__version__` attribute. Earlier code checked installation by running `import mlx_audio; print(mlx_audio.__version__)`, which threw an `AttributeError` even though the package was correctly installed.
+**Cause:** The `mlx_audio` package does not expose a `__version__` attribute. Early Handy versions checked the installation with `import mlx_audio; print(mlx_audio.__version__)`, which threw an `AttributeError` even though the package was correctly installed.
 
-**Fix:** The import check now uses `import mlx_audio; print('ok')`.
+**Fix:** The check reads the package metadata instead: `from importlib.metadata import version; print(version('mlx-audio'))`.
 
 ### App can't find `python3` or `uv` when launched from Finder
 

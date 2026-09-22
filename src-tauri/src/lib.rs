@@ -1,6 +1,7 @@
 mod actions;
 mod audio_feedback;
 pub mod audio_toolkit;
+mod chinese;
 mod clipboard;
 mod commands;
 mod managers;

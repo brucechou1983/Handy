@@ -97,18 +97,20 @@ Users can download and switch between models directly from the app's settings in
 
 **Qwen3-ASR (Apple Silicon only):**
 
-Handy also supports [Qwen3-ASR-0.6B](https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit) via mlx-audio for native Apple Silicon inference. This requires `uv` (`brew install uv`) and is set up automatically from the model selector. See the [Qwen3-ASR Setup Guide](docs/qwen3-asr-setup.md) for details and troubleshooting.
+Handy also supports [Qwen3-ASR-0.6B](https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit) via [mlx-audio](https://github.com/Blaizzy/mlx-audio) 0.5.5+ for native Apple Silicon inference. This requires `uv` (`brew install uv`) and is set up automatically from the model selector. See the [Qwen3-ASR Setup Guide](docs/qwen3-asr-setup.md) for details and troubleshooting.
 
 **Language Support:**
 
 Handy supports multilingual transcription with special handling for Chinese users:
 - **Auto**: Automatically detects the spoken language
-- **Auto (Prefer Trad. Chinese)**: Auto-detects English/Chinese, outputs Chinese as Traditional characters
-- **Chinese Traditional**: Forces Traditional Chinese output (繁體中文)
-- **Chinese Simplified**: Forces Simplified Chinese output (简体中文)
+- **Auto (Traditional Chinese)**: Auto-detects the language, and converts the result to Traditional characters whenever it is Chinese
+- **Chinese Traditional**: Chinese input, Traditional output (繁體中文)
+- **Chinese Simplified**: Chinese input, Simplified output (简体中文)
 - **50+ other languages**: Including Spanish, French, Japanese, Korean, and more
 
-The "Auto (Prefer Trad. Chinese)" option is ideal for bilingual English/Chinese speakers who want automatic language detection while ensuring Chinese text always appears in Traditional characters.
+"Auto (Traditional Chinese)" is ideal for bilingual English/Chinese speakers who want automatic language detection while ensuring Chinese text always appears in Traditional characters.
+
+Speech-to-text models emit whichever script dominated their training data, which for Mandarin is Simplified, and asking for a script in the prompt does not reliably change that. So Handy converts the transcription itself with the [OpenCC](https://github.com/BYVoid/OpenCC) rulesets (`s2twp` for Traditional, including Taiwan vocabulary such as 软件 → 軟體). This applies to both backends. Japanese and Korean transcriptions are never converted, so their Han characters stay intact.
 
 ## Architecture
 
