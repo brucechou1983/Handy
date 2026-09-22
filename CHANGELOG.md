@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.2] - 2026-09-22
+
+### Fixed
+- Chinese came out Simplified even with **Chinese Traditional** selected. Neither `請使用繁體中文輸出` (Qwen3-ASR) nor `繁體中文。` (Whisper's `initial_prompt`) is an instruction the models follow — both fields are biasing context, not instruction slots — so the script is now converted after transcription instead of being asked for in the prompt
+
+### Added
+- Simplified ⇄ Traditional conversion of the transcription itself, using the OpenCC `s2twp`/`tw2sp` rulesets (软件 → 軟體, 服务器 → 伺服器). **Chinese Traditional** and **Chinese Simplified** now hold for both the Whisper and the Qwen3-ASR backend
+- **Auto (Traditional Chinese)** language option: detect the spoken language as usual, and convert to Traditional whenever the result is Chinese. Japanese and Korean output is left alone, so shared Han characters are not mangled
+- Hotword/context support in the Qwen3-ASR sidecar protocol (`system_prompt`, `hotwords`), which is the custom-hotwords contract Qwen documented for the model in July 2026. No setting exposes it yet
+
+### Changed
+- Qwen3-ASR now runs on mlx-audio 0.5.5 from PyPI instead of a snapshot of the GitHub main branch. Setup upgrades an existing environment in place, and an environment left on an older version reports itself as out of date instead of failing at load time
+- **Auto** genuinely auto-detects on Qwen3-ASR now (mlx-audio 0.5 added it) rather than falling back to English, and the detected language is logged
+- Handy's language list is mapped onto the 30 languages Qwen3-ASR supports; the rest auto-detect instead of sending an unknown language name into the prompt
+- The sidecar calls mlx-audio's own `system_prompt`/`hotwords` arguments instead of monkey-patching its private prompt builder
+
+### Notes
+- Qwen3-ASR's **weights did not change** in the July 2026 update to [`Qwen/Qwen3-ASR-0.6B-hf`](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf): `model.safetensors` is byte-identical to the June upload, and the January weights `mlx-community/Qwen3-ASR-0.6B-8bit` was quantized from. That commit updated the README and chat template — the system message is documented as context/hotwords, and the language is forced by prefilling the assistant turn with `language <NAME><asr_text>`. mlx-audio 0.5.x implements that contract, which is what this release picks up
+
 ## [0.3.0] - 2025-07-11
 
 ### Added

@@ -10,6 +10,7 @@ interface LanguageSelectorProps {
 
 const LANGUAGES = [
   { code: "auto", name: "Auto" },
+  { code: "auto-zh-TW", name: "Auto (Traditional Chinese)" },
   { code: "en", name: "English" },
   { code: "zh", name: "Chinese (Auto)" },
   { code: "zh-TW", name: "Chinese Traditional" },
@@ -126,7 +127,7 @@ export const LanguageSelector: React.FC<LanguageSelectorProps> = ({
   return (
     <SettingContainer
       title="Language"
-      description="Select the language for speech recognition. Auto will automatically determine the language. For Chinese speakers, select Traditional or Simplified to ensure correct character output."
+      description="Select the language for speech recognition. Auto will automatically determine the language. Chinese Traditional and Chinese Simplified convert the transcription to that script; Auto (Traditional Chinese) does the same while still detecting the language."
       descriptionMode={descriptionMode}
       grouped={grouped}
     >
